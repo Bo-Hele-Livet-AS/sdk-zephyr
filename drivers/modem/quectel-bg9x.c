@@ -29,6 +29,9 @@ static const struct gpio_dt_spec dtr_gpio = GPIO_DT_SPEC_INST_GET(0, mdm_dtr_gpi
 #if DT_INST_NODE_HAS_PROP(0, mdm_wdisable_gpios)
 static const struct gpio_dt_spec wdisable_gpio = GPIO_DT_SPEC_INST_GET(0, mdm_wdisable_gpios);
 #endif
+#if DT_INST_NODE_HAS_PROP(0, mdm_pontrig_gpios)
+static const struct gpio_dt_spec pontrig_gpio = GPIO_DT_SPEC_INST_GET(0, mdm_pontrig_gpios);
+#endif
 
 static inline int digits(int n)
 {
@@ -1221,6 +1224,14 @@ static int modem_init(const struct device *dev)
 	ret = gpio_pin_configure_dt(&wdisable_gpio, GPIO_OUTPUT_LOW);
 	if (ret < 0) {
 		LOG_ERR("Failed to configure %s pin", "wdisable");
+		goto error;
+	}
+#endif
+
+#if DT_INST_NODE_HAS_PROP(0, mdm_pontrig_gpios)
+	ret = gpio_pin_configure_dt(&pontrig_gpio, GPIO_OUTPUT_HIGH);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure %s pin", "pontrig");
 		goto error;
 	}
 #endif
