@@ -7,6 +7,7 @@
 #define DT_DRV_COMPAT quectel_bg9x
 
 #include <zephyr/logging/log.h>
+
 LOG_MODULE_REGISTER(modem_quectel_bg9x, CONFIG_MODEM_LOG_LEVEL);
 
 #include "quectel-bg9x.h"
@@ -31,6 +32,12 @@ static const struct gpio_dt_spec wdisable_gpio = GPIO_DT_SPEC_INST_GET(0, mdm_wd
 #endif
 #if DT_INST_NODE_HAS_PROP(0, mdm_pontrig_gpios)
 static const struct gpio_dt_spec pontrig_gpio = GPIO_DT_SPEC_INST_GET(0, mdm_pontrig_gpios);
+#endif
+
+#if defined(CONFIG_DNS_RESOLVER)
+static struct zsock_addrinfo result;
+static struct sockaddr result_addr;
+static char result_canonname[DNS_MAX_NAME_SIZE + 1];
 #endif
 
 static inline int digits(int n)
@@ -387,23 +394,25 @@ MODEM_CMD_DEFINE(on_cmd_sock_readdata)
 	return on_cmd_sockread_common(mdata.sock_fd, data, len);
 }
 
+
+
 /* Handler: Data receive indication. */
 MODEM_CMD_DEFINE(on_cmd_unsol_recv)
 {
-	struct modem_socket *sock;
-	int		     sock_fd;
+    int		     sock_fd;
+    sock_fd = ATOI(argv[0], 0, "sock_fd");
 
-	sock_fd = ATOI(argv[0], 0, "sock_fd");
+    /* Data ready indication. */
+    LOG_INF("Data Receive Indication for socket: %d", sock_fd);
 
-	/* Socket pointer from FD. */
-	sock = modem_socket_from_fd(&mdata.socket_config, sock_fd);
-	if (!sock) {
-		return 0;
-	}
+    /* TODO: fix this, it can fail if sock_fd > MDM_MAX_SOCKETS */
+    mdata.socket_data_pending[sock_fd] = true;
 
-	/* Data ready indication. */
-	LOG_INF("Data Receive Indication for socket: %d", sock_fd);
-	modem_socket_data_ready(&mdata.socket_config, sock);
+    if(!k_work_delayable_is_pending(&mdata.recv_data_work)){
+        k_work_schedule_for_queue(&modem_workq, &mdata.recv_data_work, K_SECONDS(0));
+    } else {
+        LOG_ERR("already receiving data");
+    }
 
 	return 0;
 }
@@ -433,6 +442,114 @@ MODEM_CMD_DEFINE(on_cmd_unsol_rdy)
 {
 	k_sem_give(&mdata.sem_response);
 	return 0;
+}
+
+#if defined(CONFIG_DNS_RESOLVER)
+/* Handler: +QIURC: "dnsgip",<result>,<IP_count>,<DNS_ttl>
+ * [...
+ * +QIURC: "dnsgip",<host_IP_addr>]
+ *
+ */
+MODEM_CMD_DEFINE(on_cmd_dns) {
+    static int ip_count;
+    static int current_ip_count;
+
+    if (argc != 3 && argc != 1) {
+        LOG_ERR("unexpected message parameter count");
+        return 0;
+    }
+
+    /* information header message */
+    if (argc == 3) {
+        int result_code = ATOI(&argv[0][0], 0, "result_code");
+
+        if (result_code != 0) {
+            LOG_ERR("failed to query DNS (%i)", result_code);
+
+            return 0;
+        }
+
+        ip_count = ATOI(&argv[1][0], 0, "ip_count");
+        current_ip_count = 0;
+    } else {
+        argv[0][strlen(argv[0]) - 1] = '\0';
+
+        result_addr.sa_family = AF_INET;
+        /* skip beginning quote when parsing */
+        (void) net_addr_pton(result.ai_family, &argv[0][1],
+                             &((struct sockaddr_in *) &result_addr)->sin_addr);
+
+        current_ip_count++;
+
+        /* check if we expect more data from this URC */
+        if(current_ip_count >= ip_count){
+            k_sem_give(&mdata.sem_dns);
+        }
+
+        return 0;
+    }
+
+    return 0;
+}
+#endif
+
+/*
+ * Handler: Read received data length
+ * +QIRD: 5,5,0 -> QIRD: <total_received>,<Read_data>,<Unread_data>
+ */
+MODEM_CMD_DEFINE(on_cmd_read_recv_data_length)
+{
+    int ret, socket_id, new_total;
+    struct modem_socket *sock;
+
+    new_total = ATOI(argv[2], 0, "length");
+    sock = modem_socket_from_id(&mdata.socket_config, mdata.sock_fd);
+    if (!sock) {
+        return 0;
+    }
+
+    ret = modem_socket_packet_size_update(&mdata.socket_config, sock,
+                                          new_total);
+    if (ret < 0) {
+        LOG_ERR("socket_id:%d left_bytes:%d err: %d", mdata.sock_fd,
+                new_total, ret);
+    }
+
+    if (new_total > 0) {
+        modem_socket_data_ready(&mdata.socket_config, sock);
+    }
+
+    return 0;
+}
+
+static void modem_get_recv_data_length_work(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    char send_cmd[64];
+    int ret;
+
+    for(int i = 0;i<MDM_MAX_SOCKETS;i++)
+    {
+        if(mdata.socket_data_pending[i])
+        {
+            struct modem_cmd cmd  = MODEM_CMD("+QIRD: ", on_cmd_read_recv_data_length, 3U, ",");
+
+            snprintk(send_cmd, sizeof(send_cmd),"AT+QIRD=%u,0", i);
+
+            ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
+                                 &cmd, 1U, send_cmd, &mdata.sem_response,
+                                 MDM_CMD_TIMEOUT);
+
+            if (ret < 0) {
+                LOG_ERR("AT+QIRD ret:%d", ret);
+                continue;
+            }
+
+            mdata.socket_data_pending[i] = false;
+        }
+    }
+
+
 }
 
 /* Func: send_socket_data
@@ -844,6 +961,95 @@ static ssize_t offload_sendmsg(void *obj, const struct msghdr *msg, int flags)
 	return (ssize_t) sent;
 }
 
+#if defined(CONFIG_DNS_RESOLVER)
+/* TODO: This is a bare-bones implementation of DNS handling
+ * We ignore most of the hints like ai_family, ai_protocol and ai_socktype.
+ * Later, we can add additional handling if it makes sense.
+ */
+static int offload_getaddrinfo(const char *node, const char *service,
+                               const struct zsock_addrinfo *hints,
+                               struct zsock_addrinfo **res)
+{
+    uint32_t port = 0U;
+    int ret;
+    /* DNS command + 128 bytes for domain name parameter */
+    char sendbuf[sizeof("AT+QIDNSGIP=#,'[]'\r") + 128];
+
+    /* init result */
+    (void)memset(&result, 0, sizeof(result));
+    (void)memset(&result_addr, 0, sizeof(result_addr));
+    /* FIXME: Hard-code DNS to return only IPv4 */
+    result.ai_family = AF_INET;
+    result_addr.sa_family = AF_INET;
+    result.ai_addr = &result_addr;
+    result.ai_addrlen = sizeof(result_addr);
+    result.ai_canonname = result_canonname;
+    result_canonname[0] = '\0';
+
+    if (service) {
+        port = ATOI(service, 0U, "port");
+        if (port < 1 || port > USHRT_MAX) {
+            return DNS_EAI_SERVICE;
+        }
+    }
+
+    if (port > 0U) {
+        /* FIXME: DNS is hard-coded to return only IPv4 */
+        if (result.ai_family == AF_INET) {
+            net_sin(&result_addr)->sin_port = htons(port);
+        }
+    }
+
+    /* check to see if node is an IP address */
+    if (net_addr_pton(result.ai_family, node,
+                      &((struct sockaddr_in *)&result_addr)->sin_addr)
+        == 0) {
+        *res = &result;
+        return 0;
+    }
+
+    /* user flagged node as numeric host, but we failed net_addr_pton */
+    if (hints && hints->ai_flags & AI_NUMERICHOST) {
+        return DNS_EAI_NONAME;
+    }
+
+    k_sem_reset(&mdata.sem_dns);
+
+    snprintk(sendbuf, sizeof(sendbuf), "AT+QIDNSGIP=1,\"%s\"", node);
+    ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
+                         NULL, 0, sendbuf, &mdata.sem_response,
+                         MDM_DNS_TIMEOUT);
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = k_sem_take(&mdata.sem_dns, MDM_DNS_TIMEOUT);
+
+    if (ret < 0) {
+        return ret;
+    }
+
+    LOG_DBG("DNS RESULT: %s",
+            net_addr_ntop(result.ai_family,
+                          &net_sin(&result_addr)->sin_addr,
+                          sendbuf, NET_IPV4_ADDR_LEN));
+
+    *res = (struct zsock_addrinfo *)&result;
+    return 0;
+}
+
+static void offload_freeaddrinfo(struct zsock_addrinfo *res)
+{
+    /* using static result from offload_getaddrinfo() -- no need to free */
+    res = NULL;
+}
+
+const struct socket_dns_offload offload_dns_ops = {
+        .getaddrinfo = offload_getaddrinfo,
+        .freeaddrinfo = offload_freeaddrinfo,
+};
+#endif
+
 /* Func: modem_rx
  * Desc: Thread to process all messages received from the Modem.
  */
@@ -923,12 +1129,13 @@ static const struct modem_cmd unsol_cmds[] = {
 	MODEM_CMD("+QIURC: \"recv\",",	   on_cmd_unsol_recv,  1U, ""),
 	MODEM_CMD("+QIURC: \"closed\",",   on_cmd_unsol_close, 1U, ""),
 	MODEM_CMD("RDY", on_cmd_unsol_rdy, 0U, ""),
+    MODEM_CMD_ARGS_MAX("+QIURC: \"dnsgip\",", on_cmd_dns, 1U, 3U, ","),
 };
 
 /* Commands sent to the modem to set it up at boot time. */
 static const struct setup_cmd setup_cmds[] = {
 	SETUP_CMD_NOHANDLE("ATE0"),
-	SETUP_CMD_NOHANDLE("ATH"),
+	//SETUP_CMD_NOHANDLE("ATH"),
 	SETUP_CMD_NOHANDLE("AT+CMEE=1"),
 
 	/* Commands to read info from the modem (things like IMEI, Model etc). */
@@ -1097,6 +1304,10 @@ static void modem_net_iface_init(struct net_if *iface)
 			     NET_LINK_ETHERNET);
 	data->net_iface = iface;
 
+#ifdef CONFIG_DNS_RESOLVER
+    socket_offload_dns_register(&offload_dns_ops);
+#endif
+
 	net_if_socket_offload_set(iface, offload_socket);
 }
 
@@ -1144,6 +1355,7 @@ static int modem_init(const struct device *dev)
 	k_sem_init(&mdata.sem_response,	 0, 1);
 	k_sem_init(&mdata.sem_tx_ready,	 0, 1);
 	k_sem_init(&mdata.sem_sock_conn, 0, 1);
+    k_sem_init(&mdata.sem_dns, 0, 1);
 	k_work_queue_start(&modem_workq, modem_workq_stack,
 			   K_KERNEL_STACK_SIZEOF(modem_workq_stack),
 			   K_PRIO_COOP(7), NULL);
@@ -1253,6 +1465,8 @@ static int modem_init(const struct device *dev)
 
 	/* Init RSSI query */
 	k_work_init_delayable(&mdata.rssi_query_work, modem_rssi_query_work);
+    k_work_init_delayable(&mdata.recv_data_work, modem_get_recv_data_length_work);
+
 	return modem_setup();
 
 error:
@@ -1268,3 +1482,5 @@ NET_DEVICE_DT_INST_OFFLOAD_DEFINE(0, modem_init, NULL,
 /* Register NET sockets. */
 NET_SOCKET_OFFLOAD_REGISTER(quectel_bg9x, CONFIG_NET_SOCKETS_OFFLOAD_PRIORITY,
 			    AF_UNSPEC, offload_is_supported, offload_socket);
+
+

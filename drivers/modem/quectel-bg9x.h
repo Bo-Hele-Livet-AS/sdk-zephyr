@@ -27,6 +27,7 @@
 #define MDM_UART_NODE			  DT_INST_BUS(0)
 #define MDM_UART_DEV			  DEVICE_DT_GET(MDM_UART_NODE)
 #define MDM_CMD_TIMEOUT			  K_SECONDS(10)
+#define MDM_DNS_TIMEOUT           K_SECONDS(60)
 #define MDM_CMD_CONN_TIMEOUT		  K_SECONDS(120)
 #define MDM_REGISTRATION_TIMEOUT	  K_SECONDS(180)
 #define MDM_SENDMSG_SLEEP		  K_MSEC(1)
@@ -88,9 +89,13 @@ struct modem_data {
 	/* socket data */
 	struct modem_socket_config socket_config;
 	struct modem_socket sockets[MDM_MAX_SOCKETS];
+    bool socket_data_pending[MDM_MAX_SOCKETS];
 
 	/* RSSI work */
 	struct k_work_delayable rssi_query_work;
+
+    /* Received data work */
+    struct k_work_delayable recv_data_work;
 
 	/* modem data */
 	char mdm_manufacturer[MDM_MANUFACTURER_LENGTH];
@@ -113,6 +118,7 @@ struct modem_data {
 	struct k_sem sem_response;
 	struct k_sem sem_tx_ready;
 	struct k_sem sem_sock_conn;
+    struct k_sem sem_dns;
 };
 
 /* Socket read callback data */
