@@ -499,7 +499,7 @@ MODEM_CMD_DEFINE(on_cmd_dns) {
  */
 MODEM_CMD_DEFINE(on_cmd_read_recv_data_length)
 {
-    int ret, socket_id, new_total;
+    int ret, new_total;
     struct modem_socket *sock;
 
     new_total = ATOI(argv[2], 0, "length");
@@ -524,9 +524,9 @@ MODEM_CMD_DEFINE(on_cmd_read_recv_data_length)
 
 static void modem_get_recv_data_length_work(struct k_work *work)
 {
-    ARG_UNUSED(work);
     char send_cmd[64];
     int ret;
+    bool a_cmd_failed = false;
 
     for(int i = 0;i<MDM_MAX_SOCKETS;i++)
     {
@@ -536,12 +536,15 @@ static void modem_get_recv_data_length_work(struct k_work *work)
 
             snprintk(send_cmd, sizeof(send_cmd),"AT+QIRD=%u,0", i);
 
+            mdata.sock_fd = i;
+
             ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
                                  &cmd, 1U, send_cmd, &mdata.sem_response,
                                  MDM_CMD_TIMEOUT);
 
             if (ret < 0) {
                 LOG_ERR("AT+QIRD ret:%d", ret);
+                a_cmd_failed = true;
                 continue;
             }
 
@@ -549,7 +552,10 @@ static void modem_get_recv_data_length_work(struct k_work *work)
         }
     }
 
-
+    if(a_cmd_failed)
+    {
+        k_work_reschedule_for_queue(&modem_workq, &mdata.recv_data_work, MDM_RECV_DATA_RETRY_TIMEOUT);
+    }
 }
 
 /* Func: send_socket_data
