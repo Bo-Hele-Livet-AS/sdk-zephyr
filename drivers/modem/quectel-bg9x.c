@@ -153,6 +153,7 @@ static int on_cmd_sockread_common(int socket_fd,
 	/* check to make sure we have all of the data. */
 	if (net_buf_frags_len(data->rx_buf) < (socket_data_length + bytes_to_skip)) {
 		LOG_DBG("Not enough data -- wait!");
+        k_sleep(K_MSEC(100));
 		return -EAGAIN;
 	}
 
@@ -409,7 +410,7 @@ MODEM_CMD_DEFINE(on_cmd_unsol_recv)
     mdata.socket_data_pending[sock_fd] = true;
 
     if(!k_work_delayable_is_pending(&mdata.recv_data_work)){
-        k_work_schedule_for_queue(&modem_workq, &mdata.recv_data_work, K_SECONDS(0));
+        k_work_schedule_for_queue(&modem_workq, &mdata.recv_data_work, K_NO_WAIT);
     } else {
         LOG_ERR("already receiving data");
     }
@@ -442,6 +443,13 @@ MODEM_CMD_DEFINE(on_cmd_unsol_rdy)
 {
 	k_sem_give(&mdata.sem_response);
 	return 0;
+}
+
+MODEM_CMD_DEFINE(on_cmd_creg)
+{
+    LOG_DBG("Got creg: %s", data->match_buf);
+
+    return 0;
 }
 
 #if defined(CONFIG_DNS_RESOLVER)
@@ -524,6 +532,7 @@ MODEM_CMD_DEFINE(on_cmd_read_recv_data_length)
 
 static void modem_get_recv_data_length_work(struct k_work *work)
 {
+    ARG_UNUSED(work);
     char send_cmd[64];
     int ret;
     bool a_cmd_failed = false;
@@ -532,10 +541,9 @@ static void modem_get_recv_data_length_work(struct k_work *work)
     {
         if(mdata.socket_data_pending[i])
         {
-            struct modem_cmd cmd  = MODEM_CMD("+QIRD: ", on_cmd_read_recv_data_length, 3U, ",");
+            struct modem_cmd cmd  = MODEM_CMD_ARGS_MAX("+QIRD: ", on_cmd_read_recv_data_length, 3U, 3U, ",");
 
             snprintk(send_cmd, sizeof(send_cmd),"AT+QIRD=%u,0", i);
-
             mdata.sock_fd = i;
 
             ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
@@ -684,7 +692,7 @@ static ssize_t offload_sendto(void *obj, const void *buf, size_t len,
 	}
 
 	ret = send_socket_data(sock, to, cmd, ARRAY_SIZE(cmd), buf, len,
-			       MDM_CMD_TIMEOUT);
+                           MDM_CMD_SEND_DATA_TIMEOUT);
 	if (ret < 0) {
 		errno = -ret;
 		return -1;
@@ -950,7 +958,7 @@ static ssize_t offload_sendmsg(void *obj, const struct msghdr *msg, int flags)
 			rc = offload_sendto(obj, buf, len, flags,
 					    msg->msg_name, msg->msg_namelen);
 			if (rc < 0) {
-				if (rc == -EAGAIN) {
+				if (errno == EAGAIN) {
 					k_sleep(MDM_SENDMSG_SLEEP);
 				} else {
 					sent = rc;
@@ -1077,12 +1085,18 @@ static void modem_rssi_query_work(struct k_work *work)
 {
 	struct modem_cmd cmd  = MODEM_CMD("+CSQ: ", on_cmd_atcmdinfo_rssi_csq, 2U, ",");
 	static char *send_cmd = "AT+CSQ";
+    static char *cereg_cmd = "AT+CEREG?";
 	int ret;
 
 	/* query modem RSSI */
 	ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
 			     &cmd, 1U, send_cmd, &mdata.sem_response,
 			     MDM_CMD_TIMEOUT);
+
+    ret = modem_cmd_send(&mctx.iface, &mctx.cmd_handler,
+                         NULL, 0U, cereg_cmd, &mdata.sem_response,
+                         MDM_CMD_TIMEOUT);
+
 	if (ret < 0) {
 		LOG_ERR("AT+CSQ ret:%d", ret);
 	}
@@ -1093,6 +1107,14 @@ static void modem_rssi_query_work(struct k_work *work)
 					    &mdata.rssi_query_work,
 					    K_SECONDS(RSSI_TIMEOUT_SECS));
 	}
+}
+
+/* Func: band_setup
+ * Desc: Enable pins according to setup
+ *
+*/
+static void band_setup(void){
+    LOG_INF("Setting band:");
 }
 
 /* Func: pin_init
@@ -1136,6 +1158,7 @@ static const struct modem_cmd unsol_cmds[] = {
 	MODEM_CMD("+QIURC: \"closed\",",   on_cmd_unsol_close, 1U, ""),
 	MODEM_CMD("RDY", on_cmd_unsol_rdy, 0U, ""),
     MODEM_CMD_ARGS_MAX("+QIURC: \"dnsgip\",", on_cmd_dns, 1U, 3U, ","),
+    MODEM_CMD_ARGS_MAX("+CEREG: ", on_cmd_creg, 0, 4, ","),
 };
 
 /* Commands sent to the modem to set it up at boot time. */
@@ -1143,6 +1166,9 @@ static const struct setup_cmd setup_cmds[] = {
 	SETUP_CMD_NOHANDLE("ATE0"),
 	//SETUP_CMD_NOHANDLE("ATH"),
 	SETUP_CMD_NOHANDLE("AT+CMEE=1"),
+    SETUP_CMD_NOHANDLE("AT+CEREG=2"),
+    SETUP_CMD_NOHANDLE("AT+QCFG=\"band\",3,8080085,0,1"), //TODO: This should be configured in Kconfig or DTS
+    SETUP_CMD_NOHANDLE("AT+QCFG=\"nwscanseq\",020103,1"), //TODO: This should be configured in Kconfig or DTS
 
 	/* Commands to read info from the modem (things like IMEI, Model etc). */
 	SETUP_CMD("AT+CGMI", "", on_cmd_atcmdinfo_manufacturer, 0U, ""),
